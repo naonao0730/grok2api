@@ -204,7 +204,7 @@ class ModelService:
             grok_model="grok-3",
             model_mode="MODEL_MODE_FAST",
             tier=Tier.BASIC,
-            cost=Cost.HIGH,
+            cost=Cost.LOW,
             display_name="Grok Video",
             description="Video generation model",
             is_image=False,

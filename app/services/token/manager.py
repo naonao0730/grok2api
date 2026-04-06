@@ -540,11 +540,8 @@ class TokenManager:
             result = await usage_service.get(token_str)
 
             if result and "remainingTokens" in result:
-                new_quota = result.get("remainingTokens")
-                if new_quota is None:
-                    new_quota = result.get("remainingQueries")
-                if new_quota is None:
-                    return False
+                default_quota = _default_quota_for_pool(target_pool_name or BASIC_POOL_NAME)
+                new_quota = default_quota
                 old_quota = target_token.quota
                 old_status = target_token.status
 
@@ -978,20 +975,18 @@ class TokenManager:
 
         async def _refresh_one(item: tuple[str, TokenInfo]) -> dict:
             """刷新单个 token"""
-            _, token_info = item
+            pool_name, token_info = item
             async with semaphore:
                 token_str = token_info.token
                 if token_str.startswith("sso="):
                     token_str = token_str[4:]
 
+                default_quota = _default_quota_for_pool(pool_name)
+
                 result, status, error = await _get_usage_with_retry(token_str)
 
                 if result and "remainingTokens" in result:
-                    new_quota = result.get("remainingTokens")
-                    if new_quota is None:
-                        new_quota = result.get("remainingQueries")
-                    if new_quota is None:
-                        return {"recovered": False, "expired": False}
+                    new_quota = default_quota
                     old_quota = token_info.quota
                     old_status = token_info.status
 
@@ -1003,7 +998,7 @@ class TokenManager:
 
                     window_size = self._extract_window_size_seconds(result)
                     if window_size is not None:
-                        current_pool = self.get_pool_name_for_token(token_info.token)
+                        current_pool = self.get_pool_name_for_token(token_info.token) or pool_name
                         if (
                             current_pool == SUPER_POOL_NAME
                             and window_size >= SUPER_WINDOW_THRESHOLD_SECONDS
