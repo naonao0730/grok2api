@@ -3,7 +3,7 @@
 import base64
 import binascii
 import mimetypes
-from typing import Annotated, AsyncGenerator, AsyncIterable, Literal
+from typing import Annotated, Any, AsyncGenerator, AsyncIterable, Literal
 
 import orjson
 from fastapi import APIRouter, Depends, File, Form, Query, Request, UploadFile
@@ -194,6 +194,55 @@ async def _upload_to_data_uri(upload: UploadFile, *, param: str) -> str:
     return f"data:{mime};base64,{blob_b64}"
 
 
+def _parse_video_reference_item(value: Any, *, param: str) -> dict[str, str]:
+    if isinstance(value, str):
+        candidate = value.strip()
+        if not candidate:
+            raise ValidationError("Reference image cannot be empty", param=param)
+        return {"image_url": candidate}
+
+    if isinstance(value, dict):
+        block_type = value.get("type")
+        if block_type == "image_url":
+            image_url = value.get("image_url")
+            if isinstance(image_url, dict):
+                candidate = str(image_url.get("url") or "").strip()
+            else:
+                candidate = str(image_url or "").strip()
+        else:
+            candidate = str(value.get("image_url") or "").strip()
+        if not candidate:
+            raise ValidationError("Reference image URL cannot be empty", param=param)
+        return {"image_url": candidate}
+
+    raise ValidationError("image_reference must be an array of URLs or image_url blocks", param=param)
+
+
+def _parse_video_references(value: Any, *, param: str) -> list[dict[str, str]]:
+    if value in (None, "", []):
+        return []
+
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return []
+        if stripped.startswith("["):
+            try:
+                value = orjson.loads(stripped)
+            except orjson.JSONDecodeError as exc:
+                raise ValidationError("image_reference must be a JSON array", param=param) from exc
+        else:
+            value = [stripped]
+
+    if not isinstance(value, list):
+        raise ValidationError("image_reference must be an array", param=param)
+
+    refs: list[dict[str, str]] = []
+    for idx, item in enumerate(value):
+        refs.append(_parse_video_reference_item(item, param=f"{param}.{idx}"))
+    return refs
+
+
 @router.post("/chat/completions", tags=[_TAG_CHAT], dependencies=[Depends(verify_api_key)])
 async def chat_completions_endpoint(req: ChatCompletionRequest):
     _validate_chat(req)
@@ -247,15 +296,17 @@ async def chat_completions_endpoint(req: ChatCompletionRequest):
 
         elif spec.is_video():
             from .video import completions as vid_comp
+            from .video import normalize_video_size_input as _normalize_video_size_input
             vcfg = req.video_config or VideoConfig()
             from .video import validate_video_length as _validate_video_length
-            _validate_video_length(vcfg.seconds or 6)
+            resolved_seconds = vcfg.video_length or vcfg.seconds or 6
+            _validate_video_length(resolved_seconds)
             result = await vid_comp(
                 model           = req.model,
                 messages        = messages,
                 stream          = req.stream,
-                seconds         = vcfg.seconds or 6,
-                size            = vcfg.size or "720x1280",
+                seconds         = resolved_seconds,
+                size            = _normalize_video_size_input(vcfg.size, vcfg.aspect_ratio),
                 resolution_name = vcfg.resolution_name,
                 preset          = vcfg.preset,
             )
@@ -392,31 +443,80 @@ async def image_generations(req: ImageGenerationRequest):
 # ---------------------------------------------------------------------------
 
 @router.post("/videos", tags=[_TAG_VIDEOS], dependencies=[Depends(verify_api_key)])
-async def videos_create(
-    model: Annotated[str, Form(...)],
-    prompt: Annotated[str, Form(...)],
-    seconds: Annotated[int, Form()] = 6,
-    size: Annotated[Literal["720x1280", "1280x720", "1024x1024", "1024x1792", "1792x1024"], Form()] = "720x1280",
-    resolution_name: Annotated[Literal["480p", "720p"] | None, Form()] = None,
-    preset: Annotated[Literal["fun", "normal", "spicy", "custom"] | None, Form()] = None,
-    input_reference: Annotated[UploadFile | None, File()] = None,
-):
+async def videos_create(request: Request):
     from .video import create_video
+    from .video import normalize_video_size_input as _normalize_video_size_input
+    from .video import resolve_quality_to_resolution_name as _resolve_quality_to_resolution_name
 
-    reference_payload = None
-    if input_reference is not None:
-        reference_payload = {
-            "image_url": await _upload_to_data_uri(input_reference, param="input_reference"),
-        }
+    content_type = (request.headers.get("content-type") or "").lower()
+
+    model = "grok-imagine-video"
+    prompt = ""
+    seconds: int | str | None = 6
+    size: str | None = None
+    aspect_ratio: str | None = None
+    resolution_name: str | None = None
+    quality: str | None = None
+    preset: str | None = None
+    input_references: list[dict[str, str]] = []
+
+    if "multipart/form-data" in content_type:
+        form = await request.form()
+        model = str(form.get("model") or model)
+        prompt = str(form.get("prompt") or "")
+        seconds = form.get("seconds") or 6
+        size = str(form.get("size") or "").strip() or None
+        aspect_ratio = str(form.get("aspect_ratio") or "").strip() or None
+        resolution_name = str(form.get("resolution_name") or "").strip() or None
+        quality = str(form.get("quality") or "").strip() or None
+        preset = str(form.get("preset") or "").strip() or None
+        input_references.extend(_parse_video_references(form.get("image_reference"), param="image_reference"))
+        upload = form.get("input_reference")
+        if isinstance(upload, UploadFile):
+            input_references.append(
+                {"image_url": await _upload_to_data_uri(upload, param="input_reference")}
+            )
+        elif upload not in (None, ""):
+            raise ValidationError("input_reference must be an uploaded image", param="input_reference")
+    else:
+        try:
+            payload = await request.json()
+        except Exception as exc:
+            raise ValidationError("Request body must be JSON or multipart/form-data", param="body") from exc
+        if not isinstance(payload, dict):
+            raise ValidationError("Request body must be a JSON object", param="body")
+
+        model = str(payload.get("model") or model)
+        prompt = str(payload.get("prompt") or "")
+        seconds = payload.get("seconds", 6)
+        size = str(payload.get("size") or "").strip() or None
+        aspect_ratio = str(payload.get("aspect_ratio") or "").strip() or None
+        resolution_name = str(payload.get("resolution_name") or "").strip() or None
+        quality = str(payload.get("quality") or "").strip() or None
+        preset = str(payload.get("preset") or "").strip() or None
+        input_references.extend(_parse_video_references(payload.get("image_reference"), param="image_reference"))
+
+        raw_input_reference = payload.get("input_reference")
+        if raw_input_reference not in (None, ""):
+            if not isinstance(raw_input_reference, dict):
+                raise ValidationError("input_reference must be an object with image_url", param="input_reference")
+            image_url = str(raw_input_reference.get("image_url") or "").strip()
+            if not image_url:
+                raise ValidationError("input_reference.image_url is required", param="input_reference.image_url")
+            input_references.append({"image_url": image_url})
+
+    if quality and not resolution_name:
+        resolution_name = _resolve_quality_to_resolution_name(quality)
 
     result = await create_video(
-        model=model or "grok-video",
+        model=model,
         prompt=prompt,
         seconds=seconds,
-        size=size or "720x1280",
+        size=_normalize_video_size_input(size, aspect_ratio),
         resolution_name=resolution_name,
+        quality=quality,
         preset=preset,
-        input_reference=reference_payload,
+        input_reference=input_references or None,
     )
     return JSONResponse(result)
 

@@ -1,8 +1,11 @@
 """OpenAI-compatible request schemas (Pydantic models)."""
 
-from typing import Any, Literal
+from typing import Any, Literal, TypeAlias
 
 from pydantic import BaseModel, Field
+
+VideoSize: TypeAlias = Literal["720x1280", "1280x720", "1024x1024", "1024x1792", "1792x1024"]
+VideoAspectRatio: TypeAlias = Literal["16:9", "9:16", "1:1", "2:3", "3:2", "1280x720", "720x1280", "1024x1024", "1024x1792", "1792x1024"]
 
 
 class MessageItem(BaseModel):
@@ -21,7 +24,9 @@ class ImageConfig(BaseModel):
 
 class VideoConfig(BaseModel):
     seconds: int | None = 6
-    size: Literal["720x1280", "1280x720", "1024x1024", "1024x1792", "1792x1024"] | None = "720x1280"
+    video_length: int | None = None
+    size: VideoSize | None = "720x1280"
+    aspect_ratio: VideoAspectRatio | None = None
     resolution_name: Literal["480p", "720p"] | None = None
     preset: Literal["fun", "normal", "spicy", "custom"] | None = None
 
